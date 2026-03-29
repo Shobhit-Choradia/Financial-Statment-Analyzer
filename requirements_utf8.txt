@@ -32,12 +32,12 @@ nest-asyncio==1.6.0
 nltk==3.9.3
 numpy==2.4.3
 packaging<26
-pandas==3.0.1
+pandas==2.2.3
 parso==0.8.6
 pillow==12.1.1
 platformdirs==4.9.4
 prompt_toolkit==3.0.52
-protobuf==7.34.1
+protobuf==5.29.4
 psutil==7.2.2
 pure_eval==0.2.3
 Pygments==2.19.2
@@ -65,5 +65,5 @@ wcwidth==0.6.0
 
 # App dependencies (Streamlit + OCR)
 streamlit==1.46.1
-pytesseract
-pdf2image
+pytesseract==0.3.13
+pdf2image==1.17.0
