@@ -6,12 +6,10 @@ from typing import Optional, Tuple
 import numpy as np
 import streamlit as st
 
-
 MODEL_CHOICES = {
     "SVM (word TF-IDF) — baseline": "data/pkls/svm.pkl",
     "SVM (character TF-IDF) — higher accuracy": "data/pkls/svm_char.pkl",
 }
-
 
 SENTIMENT_META = {
     "positive": {
@@ -34,10 +32,8 @@ SENTIMENT_META = {
     },
 }
 
-
 SAMPLE_TEXT = """Tesla reported record quarterly revenue, beating analyst expectations.
 Gross margins improved as production costs declined, and management raised guidance for the next quarter."""
-
 
 @dataclass(frozen=True)
 class PredictionResult:
@@ -46,6 +42,79 @@ class PredictionResult:
     confidence: Optional[float]
     explanation: str
 
+def _split_candidate_lines(text: str) -> list[str]:
+    """
+    Build candidate units to explain predictions:
+    - Prefer natural newlines if the document already has them.
+    - Fall back to sentence chunks for single-paragraph text.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        return lines
+
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text or "") if p.strip()]
+    return parts or lines
+
+def _top_k_for_input(text: str, available_items: int) -> int:
+    """
+    Return a dynamic number of evidence lines based on input size.
+    """
+    length = len(text or "")
+    if length < 280:
+        wanted = 1
+    elif length < 900:
+        wanted = 3
+    elif length < 2500:
+        wanted = 5
+    else:
+        wanted = 7
+    return max(1, min(wanted, available_items))
+
+def _score_text_for_class(model, text: str, target_class: str) -> Optional[float]:
+    cleaned = preprocess_text(text)
+    if not cleaned:
+        return None
+
+    classes = getattr(model, "classes_", None)
+    if classes is None:
+        return None
+
+    class_labels = [str(c).lower() for c in classes]
+    if target_class not in class_labels:
+        return None
+    target_idx = class_labels.index(target_class)
+
+    if hasattr(model, "predict_proba"):
+        probs = model.predict_proba([cleaned])[0]
+        return float(probs[target_idx])
+
+    if hasattr(model, "decision_function"):
+        scores = np.asarray(model.decision_function([cleaned]))
+        if scores.ndim == 1:
+            # Binary case: sklearn margin sign corresponds to classes_[1].
+            margin = float(scores[0])
+            signed_margin = margin if target_idx == 1 else -margin
+            return float(1.0 / (1.0 + np.exp(-signed_margin)))
+
+        margins = np.asarray(scores[0], dtype=np.float64)
+        probs = _softmax(margins)
+        return float(probs[target_idx])
+
+    # Last-resort fallback when probability/margins are unavailable.
+    pred = str(model.predict([cleaned])[0]).lower()
+    return 1.0 if pred == target_class else 0.0
+
+def top_supporting_lines(model, text: str, target_class: str) -> list[Tuple[str, float]]:
+    candidates = _split_candidate_lines(text)
+    scored: list[Tuple[str, float]] = []
+    for line in candidates:
+        score = _score_text_for_class(model, line, target_class)
+        if score is not None:
+            scored.append((line, score))
+
+    scored.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
+    keep = _top_k_for_input(text, len(scored))
+    return scored[:keep]
 
 def preprocess_text(text: str) -> str:
     """
@@ -58,20 +127,17 @@ def preprocess_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
 def _softmax(x: np.ndarray) -> np.ndarray:
     x = x.astype(np.float64)
     x = x - np.max(x)
     ex = np.exp(x)
     return ex / np.sum(ex)
 
-
 @st.cache_resource(show_spinner=False)
 def load_model(model_path: str):
     import joblib
 
     return joblib.load(model_path)
-
 
 def predict_sentiment(model, text: str) -> PredictionResult:
     cleaned = preprocess_text(text)
@@ -128,7 +194,6 @@ def predict_sentiment(model, text: str) -> PredictionResult:
         explanation=meta["explanation"],
     )
 
-
 def _require_ocr_deps():
     """
     Import OCR dependencies lazily so manual input mode works even if OCR libs
@@ -150,7 +215,6 @@ def _require_ocr_deps():
     except Exception as e:
         raise RuntimeError(f"OCR requires Pillow (`pillow`). Import error: {e}") from e
 
-
 def _configure_tesseract_if_needed():
     """
     Optional: allow users to set a custom tesseract command path without code edits.
@@ -163,7 +227,6 @@ def _configure_tesseract_if_needed():
 
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-
 def ocr_image_bytes(image_bytes: bytes) -> str:
     _require_ocr_deps()
     _configure_tesseract_if_needed()
@@ -175,7 +238,6 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
     # A small boost for OCR consistency on receipts/scans.
     img = img.convert("L")
     return (pytesseract.image_to_string(img) or "").strip()
-
 
 def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 25) -> str:
     _require_ocr_deps()
@@ -215,7 +277,6 @@ def ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 25) -> str:
 
     return "\n\n".join(chunks).strip()
 
-
 def render_card(result: PredictionResult) -> None:
     meta = SENTIMENT_META.get(result.raw_class, None)
     color = (meta or {}).get("color", "#64748b")
@@ -240,6 +301,27 @@ def render_card(result: PredictionResult) -> None:
         unsafe_allow_html=True,
     )
 
+def render_supporting_lines(lines: list[Tuple[str, float]], result_label: str) -> None:
+    st.markdown("#### Top supporting lines")
+    if not lines:
+        st.caption("No line-level explanation available for this input/model.")
+        return
+
+    min_confidence = 0.60
+    filtered = [(line, score) for line, score in lines if score > min_confidence]
+    if not filtered:
+        st.caption(
+            f"No lines exceeded {min_confidence:.0%} support confidence for **{result_label}** sentiment."
+        )
+        return
+
+    st.caption(
+        f"Showing {len(filtered)} lines most related to **{result_label}** sentiment "
+        f"(support confidence > {min_confidence:.0%})."
+    )
+    for idx, (line, score) in enumerate(filtered, start=1):
+        st.markdown(f"**{idx}.** {line}")
+        st.caption(f"Support score: {score:.2%}")
 
 def _inject_css():
     st.markdown(
@@ -286,16 +368,13 @@ def _inject_css():
         unsafe_allow_html=True,
     )
 
-
 def init_state():
     st.session_state.setdefault("extracted_text", "")
     st.session_state.setdefault("show_full_text", False)
 
-
 def clear_all():
     st.session_state["extracted_text"] = ""
     st.session_state["show_full_text"] = False
-
 
 def main():
     st.set_page_config(
@@ -470,15 +549,17 @@ def main():
                 with st.spinner("Loading model and analyzing..."):
                     model = load_model(model_path)
                     result = predict_sentiment(model, extracted_text)
+                    supporting = top_supporting_lines(model, extracted_text, result.raw_class)
 
                 render_card(result)
+                render_supporting_lines(supporting, result.label)
             except Exception as e:
                 st.error(f"Analysis failed: {e}")
 
     st.write("")
     st.caption("Built with NLP + ML")
 
-
 if __name__ == "__main__":
     main()
+
 
